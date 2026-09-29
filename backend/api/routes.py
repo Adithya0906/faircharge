@@ -3,7 +3,7 @@ import random
 from datetime import datetime, timedelta
 from typing import Optional, List
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Security, Header, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, delete
 
@@ -18,12 +18,13 @@ from backend.api.schemas import (
 )
 from backend.scheduler.engine import run_scheduler
 from backend.scheduler.models import VehicleRequest, Charger
-from backend.simulation.campus_energy import CampusEnergySimulator
+from backend.simulation.campus_energy import CampusEnergySimulator, tou_grid_tariff
+from backend.core.security import (
+    verify_admin_credentials, create_access_token,
+    verify_access_token, get_current_admin, ADMIN_USERS
+)
 
 router = APIRouter()
-
-ADMIN_PASSWORD = "admin123"
-ADMIN_USERS = {"admin": "Campus Manager", "ops": "Operations Team"}
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -77,7 +78,26 @@ def campus_config_dict(config: CampusConfig) -> dict:
     }
 
 
-# ── routes ────────────────────────────────────────────────────────────────────
+# ── Auth & Admin Endpoints ───────────────────────────────────────────────────
+
+@router.post("/admin/login")
+async def admin_login(admin_id: str = Query(...), password: str = Query(...)):
+    """
+    Secure JWT-backed admin login endpoint.
+    Replaces static credential checks with environment-variable-backed role authentication.
+    """
+    user_info = verify_admin_credentials(admin_id, password)
+    token = create_access_token(admin_id)
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "admin_id": admin_id,
+        "admin_name": user_info["name"],
+        "role": user_info["role"],
+    }
+
+
+# ── Charging Endpoints ────────────────────────────────────────────────────────
 
 @router.post("/charging/request", response_model=ChargingRequestResponse)
 async def create_charging_request(
@@ -274,15 +294,22 @@ async def get_chargers(db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/energy")
-async def get_energy(db: AsyncSession = Depends(get_db)):
+async def get_energy(
+    scenario: str = Query("normal"),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Get 96-slot energy profile with dynamic ToU grid tariffs and intermittency profiles.
+    """
     result = await db.execute(
         select(EnergyDataPoint).order_by(EnergyDataPoint.timestamp.desc()).limit(96)
     )
     records = result.scalars().all()
     if not records:
         now = datetime.utcnow()
-        sim = CampusEnergySimulator(seed=42)
+        sim = CampusEnergySimulator(scenario=scenario, seed=42)
         return sim.generate_day_profile(now)
+    
     return [
         {
             "timestamp": r.timestamp.isoformat(),
@@ -293,6 +320,7 @@ async def get_energy(db: AsyncSession = Depends(get_db)):
             "battery_discharging_kw": r.battery_discharging_kw,
             "grid_import_kw": r.grid_import_kw,
             "ev_charging_load_kw": r.ev_charging_load_kw,
+            "tou_tariff": tou_grid_tariff(r.timestamp),
         }
         for r in reversed(records)
     ]
@@ -300,12 +328,23 @@ async def get_energy(db: AsyncSession = Depends(get_db)):
 
 @router.post("/admin/override")
 async def admin_override(
-    body: AdminOverrideRequest, db: AsyncSession = Depends(get_db)
+    body: AdminOverrideRequest,
+    current_admin: Optional[Dict] = Depends(get_current_admin),
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db)
 ):
-    if body.admin_password != ADMIN_PASSWORD:
-        raise HTTPException(status_code=403, detail="Invalid admin credentials")
-    if body.admin_id not in ADMIN_USERS:
-        raise HTTPException(status_code=403, detail="Admin ID not recognised")
+    """
+    Admin override endpoint supporting environment-variable auth & JWT Bearer tokens.
+    """
+    admin_name = body.admin_name
+    admin_id = body.admin_id
+
+    if current_admin:
+        admin_id = current_admin.get("sub", admin_id)
+        admin_name = current_admin.get("name", admin_name)
+    else:
+        # Fallback to credential verification backed by env var
+        verify_admin_credentials(body.admin_id, body.admin_password)
 
     req_result = await db.execute(
         select(ChargingRequest).where(ChargingRequest.request_id == body.request_id)
@@ -325,7 +364,7 @@ async def admin_override(
         updates: dict = {
             "is_admin_override": True,
             "priority_score": body.new_priority_score,
-            "explanation": f"[ADMIN OVERRIDE by {body.admin_name}] {body.reason}",
+            "explanation": f"[ADMIN OVERRIDE by {admin_name}] {body.reason}",
         }
         if body.new_charger_id:
             updates["charger_id"] = body.new_charger_id
@@ -345,8 +384,8 @@ async def admin_override(
     )
     override = AdminOverride(
         override_id=f"OVR-{uuid.uuid4().hex[:8].upper()}",
-        admin_id=body.admin_id,
-        admin_name=body.admin_name,
+        admin_id=admin_id,
+        admin_name=admin_name,
         vehicle_id=body.vehicle_id,
         request_id=body.request_id,
         reason=body.reason,
@@ -361,7 +400,7 @@ async def admin_override(
         "status": "override_applied",
         "override_id": override.override_id,
         "vehicle_id": body.vehicle_id,
-        "admin": body.admin_name,
+        "admin": admin_name,
         "old_priority": old_priority,
         "new_priority": body.new_priority_score,
         "reason": body.reason,
